@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.13.35818.85 d17.13
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NuclearOption-AirDataAnnouncer", "NuclearOption-AirDataAnnouncer.csproj", "{2EC2BF19-52B3-4AA1-A091-AC0F165420B2}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{2EC2BF19-52B3-4AA1-A091-AC0F165420B2}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2EC2BF19-52B3-4AA1-A091-AC0F165420B2}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2EC2BF19-52B3-4AA1-A091-AC0F165420B2}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2EC2BF19-52B3-4AA1-A091-AC0F165420B2}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {3266F276-9A7F-408C-BC3E-87B9AE15B8EE}
+	EndGlobalSection
+EndGlobal
