@@ -12,7 +12,7 @@ using UnityEngine.Networking;
 
 namespace AirDataAnnouncer
 {
-    [BepInPlugin("com.yourname.airdataannouncer", "AirDataAnnouncer", "1.1.0")]
+    [BepInPlugin("com.yourname.airdataannouncer", "AirDataAnnouncer", "1.3.7")]
     public class AirDataAnnouncer : BaseUnityPlugin
     {
         public static AirDataAnnouncer Instance { get; private set; }
@@ -28,13 +28,15 @@ namespace AirDataAnnouncer
         const string SectionAlt = "2. Altitude Callouts";
         const string SectionMach = "3. Mach Callouts";
         const string SectionGear = "4. Gear Callouts";
+        const string SectionRunway = "5. Approach & Minimums";
 
         // --- Configuration ---
         internal static ConfigEntry<string> SoundPack;
         internal static ConfigEntry<float> MasterVolume;
         internal static ConfigEntry<bool> DebugMode;
+        internal static ConfigEntry<bool> LogToFile;
 
-        // Altitude Callouts (0 removed)
+        // Altitude Callouts
         internal static ConfigEntry<bool> Callout10;
         internal static ConfigEntry<bool> Callout20;
         internal static ConfigEntry<bool> Callout30;
@@ -50,6 +52,9 @@ namespace AirDataAnnouncer
         internal static ConfigEntry<bool> Callout2500;
         internal static ConfigEntry<AltCalloutStyle> Callout2500Style;
 
+        // Overrides
+        internal static Dictionary<string, ConfigEntry<string>> PackOverrides = new Dictionary<string, ConfigEntry<string>>();
+
         // Mach Callouts
         internal static Dictionary<int, ConfigEntry<bool>> MachCallouts = new Dictionary<int, ConfigEntry<bool>>();
         internal static ConfigEntry<bool> SubsonicCallouts;
@@ -61,11 +66,37 @@ namespace AirDataAnnouncer
         internal static ConfigEntry<bool> GearUpLockedCallout;
         internal static ConfigEntry<bool> ContactCallout;
 
+        // New Callouts
+        internal static ConfigEntry<bool> CalloutRetard;
+        internal static ConfigEntry<bool> CalloutMinimums;
+        internal static ConfigEntry<int> MinimumsAltitude;
+        internal static ConfigEntry<bool> Callout100Above;
+        internal static ConfigEntry<bool> CalloutClearedToLand;
+
         // --- State ---
         public static Aircraft CurrentAircraft;
         public LandingGear[] CurrentLandingGears;
         private AudioSource audioSource;
+
+        // Cache: Key = CalloutName (e.g. "10"), Value = AudioClip
         public Dictionary<string, AudioClip> clipCache = new Dictionary<string, AudioClip>();
+
+        // Audio Queue System
+        private struct QueuedClip
+        {
+            public string Name;
+            public AudioClip Clip;
+            public bool IsAltitude; // Added flag for skipping logic
+        }
+        private Queue<QueuedClip> audioQueue = new Queue<QueuedClip>();
+        private string currentPlayingClipName = "";
+
+        // Available Packs for UI
+        public string[] availablePacks;
+        public string[] availablePacksWithDefault;
+
+        // UI State for Dropdowns
+        public Dictionary<string, bool> dropdownStates = new Dictionary<string, bool>();
 
         // Tracking Variables
         private float prevRadarAlt;
@@ -77,7 +108,13 @@ namespace AirDataAnnouncer
 
         // Contact Tracking
         private bool wasGrounded;
-        private bool contactArmed = false; // Controls if "contact" is allowed to play
+        private bool contactArmed = false;
+
+        // Approach Tracking
+        private bool minimumsCalloutPlayed = false;
+        private bool hundredAboveCalloutPlayed = false;
+        private float lastClearedToLandTime = -999f;
+        private float lastRetardTime = -999f; // Debounce for Retard
 
         private bool soundsLoaded = false;
         private string debugMessage = "";
@@ -87,17 +124,80 @@ namespace AirDataAnnouncer
         private bool reflectionInitialized = false;
         private object playerSettingsInstance;
         private MemberInfo unitSystemMember;
+        private FieldInfo throttleField;
 
         private void Awake()
         {
             Instance = this;
 
+            RefreshSoundPackList();
             SetupConfig();
             EnsureAudioSourceExists();
-            Harmony.CreateAndPatchAll(typeof(AirDataAnnouncer));
-            StartCoroutine(LoadSoundPack());
+
+            // Standard patches
+            var harmony = Harmony.CreateAndPatchAll(typeof(AirDataAnnouncer));
+
+            // Manual Dynamic Patch for AircraftActionsReport (Text Detection)
+            try
+            {
+                var reportType = AccessTools.TypeByName("AircraftActionsReport");
+                if (reportType != null)
+                {
+                    var original = AccessTools.Method(reportType, "ReportText");
+                    var patch = AccessTools.Method(typeof(AirDataAnnouncer), nameof(ReportTextHook));
+
+                    if (original != null && patch != null)
+                    {
+                        harmony.Patch(original, postfix: new HarmonyMethod(patch));
+                        Logger.LogInfo("Successfully hooked AircraftActionsReport.ReportText");
+                    }
+                }
+            }
+            catch (System.Exception ex)
+            {
+                Logger.LogError($"Failed to hook text report: {ex.Message}");
+            }
+
+            StartCoroutine(LoadAllSounds());
 
             Logger.LogInfo("AirDataAnnouncer initialized.");
+        }
+
+        // --- Hook for Cleared to Land ---
+        public static void ReportTextHook(string report)
+        {
+            if (Instance == null || string.IsNullOrEmpty(report)) return;
+
+            // Check LogToFile config
+            if (LogToFile.Value) Instance.Logger.LogInfo($"[ReportText]: {report}");
+
+            if (!CalloutClearedToLand.Value) return;
+
+            if (Time.time - Instance.lastClearedToLandTime < 5f) return;
+
+            // Updated text detection string
+            if (report.IndexOf("Cleared for landing", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                Instance.PlaySound("Cleared To Land");
+                Instance.lastClearedToLandTime = Time.time;
+            }
+        }
+
+        private void RefreshSoundPackList()
+        {
+            string basePath = Path.Combine(Paths.PluginPath, "AirDataAnnouncer", "Soundpacks");
+            if (Directory.Exists(basePath))
+            {
+                availablePacks = Directory.GetDirectories(basePath).Select(Path.GetFileName).ToArray();
+            }
+            else
+            {
+                availablePacks = new string[] { "Altea" };
+            }
+
+            var list = new List<string> { "Default" };
+            list.AddRange(availablePacks);
+            availablePacksWithDefault = list.ToArray();
         }
 
         private void Update()
@@ -110,6 +210,7 @@ namespace AirDataAnnouncer
 
             if (CurrentAircraft == null || !soundsLoaded) return;
 
+            ProcessAudioQueue();
             ProcessAltitude();
             ProcessMach();
             ProcessGear();
@@ -126,7 +227,6 @@ namespace AirDataAnnouncer
             }
         }
 
-        // --- Visual Debugging ---
         private void OnGUI()
         {
             if (!DebugMode.Value || string.IsNullOrEmpty(debugMessage)) return;
@@ -139,11 +239,9 @@ namespace AirDataAnnouncer
             GUI.skin.label.fontSize = 32;
             GUI.skin.label.alignment = TextAnchor.UpperCenter;
 
-            // Shadow
             GUI.color = Color.black;
             GUI.Label(new Rect((Screen.width / 2) - 200 + 2, 80 + 2, 400, 100), debugMessage);
 
-            // Text
             GUI.color = Color.yellow;
             GUI.Label(new Rect((Screen.width / 2) - 200, 80, 400, 100), debugMessage);
 
@@ -152,80 +250,131 @@ namespace AirDataAnnouncer
             GUI.skin.label.alignment = prevAlign;
         }
 
-        // --- Logic Loops ---
+        private void ProcessAudioQueue()
+        {
+            EnsureAudioSourceExists();
+
+            if (audioSource.isPlaying)
+            {
+                // Special Exception: If "Retard" is playing and throttle is cut, stop immediately
+                // to allow next queued sound (if any) or silence.
+                if (currentPlayingClipName == "Retard")
+                {
+                    if (GetThrottle() <= 0.05f)
+                    {
+                        audioSource.Stop();
+                        if (DebugMode.Value) debugMessage = ""; // Clear text if stopped
+                    }
+                }
+                return; // Wait for current sound to finish
+            }
+
+            if (audioQueue.Count > 0)
+            {
+                var next = audioQueue.Dequeue();
+                currentPlayingClipName = next.Name;
+                audioSource.clip = next.Clip;
+                audioSource.volume = MasterVolume.Value;
+                audioSource.Play();
+            }
+            else
+            {
+                currentPlayingClipName = "";
+            }
+        }
+
+        // Updated PlaySound with skipping logic for altitudes
+        public void PlaySound(string clipName, bool isAltitude = false)
+        {
+            if (DebugMode.Value)
+            {
+                debugMessage = $"GPWS: {clipName.ToUpper()}";
+                debugMessageTimer = 2.0f;
+            }
+
+            EnsureAudioSourceExists();
+
+            if (clipCache.TryGetValue(clipName, out AudioClip clip))
+            {
+                if (clip != null)
+                {
+                    if (isAltitude)
+                    {
+                        // Optimization: If the new sound is an altitude callout,
+                        // remove any PENDING altitude callouts from the queue.
+                        // This prevents "200, 100, 50" stack up during fast descent.
+                        // We filter out any QueuedClip where IsAltitude is true.
+                        var filteredList = audioQueue.Where(x => !x.IsAltitude).ToList();
+
+                        // If we removed items and debug is on, log it
+                        if (LogToFile.Value && filteredList.Count < audioQueue.Count)
+                        {
+                            Logger.LogInfo($"Skipping {audioQueue.Count - filteredList.Count} stale altitude callouts for {clipName}");
+                        }
+
+                        // Rebuild queue
+                        audioQueue = new Queue<QueuedClip>(filteredList);
+                    }
+
+                    // Enqueue new clip
+                    audioQueue.Enqueue(new QueuedClip { Name = clipName, Clip = clip, IsAltitude = isAltitude });
+                }
+                else if (LogToFile.Value)
+                {
+                    Logger.LogWarning($"Sound '{clipName}' key exists but clip is null.");
+                }
+            }
+            else
+            {
+                if (DebugMode.Value && LogToFile.Value)
+                {
+                    Logger.LogWarning($"Sound '{clipName}' not found in cache.");
+                    debugMessage += " (MISSING)";
+                }
+            }
+        }
 
         private void ProcessContact()
         {
             if (!ContactCallout.Value || CurrentLandingGears == null) return;
 
-            // 1. Determine Grounded State
             bool isGrounded = false;
-            foreach (var gear in CurrentLandingGears)
-            {
-                if (gear.WeightOnWheel(0.1f))
-                {
-                    isGrounded = true;
-                    break;
-                }
-            }
+            foreach (var gear in CurrentLandingGears) { if (gear.WeightOnWheel(0.1f)) { isGrounded = true; break; } }
 
-            // 2. Arming Logic
-            // Arm if we are NOT grounded and have climbed slightly (to avoid jitter while taxiing)
-            // Or if we are high enough.
             if (!contactArmed && !isGrounded)
             {
-                if (CurrentAircraft.radarAlt > 2.0f)
-                {
-                    contactArmed = true;
-                    if (DebugMode.Value) Logger.LogInfo("Contact Callout ARMED");
-                }
+                if (CurrentAircraft.radarAlt > 2.0f) contactArmed = true;
             }
 
-            // 3. Trigger Logic
-            // Fire if armed, we just touched down (isGrounded && !wasGrounded)
             if (contactArmed && isGrounded && !wasGrounded)
             {
                 PlaySound("contact");
-                contactArmed = false; // Disarm until next takeoff
-                if (DebugMode.Value) Logger.LogInfo("Contact Callout FIRED & DISARMED");
+                contactArmed = false;
             }
-
             wasGrounded = isGrounded;
         }
 
         private void ProcessGear()
         {
-            // 1. Gear Switch (Command) Logic
             bool currentDeployed = CurrentAircraft.gearDeployed;
             if (currentDeployed != prevGearDeployed)
             {
-                if (DebugMode.Value) Logger.LogInfo($"Gear Switch Changed: {currentDeployed}");
-
                 if (currentDeployed && GearDownCallout.Value) PlaySound("Gear Down");
                 else if (!currentDeployed && GearUpCallout.Value) PlaySound("Gear Up");
             }
             prevGearDeployed = currentDeployed;
 
-            // 2. Gear Physical State (Locked) Logic
             LandingGear.GearState currentState = CurrentAircraft.gearState;
             if (currentState != prevGearState)
             {
-                if (DebugMode.Value) Logger.LogInfo($"Gear State Transition: {prevGearState} -> {currentState}");
-
-                // Down & Locked
                 if (currentState == LandingGear.GearState.LockedExtended && GearDownLockedCallout.Value)
                 {
                     PlaySound("Gear Down and Locked");
                 }
                 else
                 {
-                    // Transition TO Up & Locked
                     string stateName = currentState.ToString();
-
-                    // Filter transient states (Retracting, Extending)
                     bool isTransient = stateName.Contains("ing") || stateName.Contains("Ing");
-
-                    // Check for variations of Up/Retracted
                     bool isRetractedState = (stateName.Contains("Retract") || stateName.Contains("Stow") || (stateName.Contains("Up") && stateName.Contains("Lock")));
 
                     if (isRetractedState && !isTransient && GearUpLockedCallout.Value)
@@ -239,15 +388,52 @@ namespace AirDataAnnouncer
 
         private void ProcessAltitude()
         {
-            if (!CurrentAircraft.gearDeployed) return;
+            if (!CurrentAircraft.gearDeployed)
+            {
+                minimumsCalloutPlayed = false;
+                hundredAboveCalloutPlayed = false;
+                return;
+            }
 
             float currentAlt = CurrentAircraft.radarAlt;
+            if (IsImperial()) currentAlt *= 3.28084f;
 
-            // Bind units to game setting: Metric (Default) or Imperial
-            // Uses reflection to find the setting to avoid "Type is not a variable" errors
-            if (IsImperial())
+            if (CalloutRetard.Value)
             {
-                currentAlt *= 3.28084f; // Convert Meters to Feet
+                bool shouldRetard = (prevRadarAlt > 20 && currentAlt <= 20) || (prevRadarAlt > 10 && currentAlt <= 10);
+
+                // Check debounce (1 second)
+                if (shouldRetard && (Time.time - lastRetardTime > 1.0f))
+                {
+                    float throttle = GetThrottle();
+                    if (throttle > 0.05f)
+                    {
+                        PlaySound("Retard");
+                        lastRetardTime = Time.time;
+                    }
+                }
+            }
+
+            if (CalloutMinimums.Value)
+            {
+                float min = MinimumsAltitude.Value;
+                if (prevRadarAlt > min && currentAlt <= min)
+                {
+                    PlaySound("Minimum");
+                    minimumsCalloutPlayed = true;
+                }
+                else if (currentAlt > min + 200) minimumsCalloutPlayed = false;
+            }
+
+            if (Callout100Above.Value)
+            {
+                float thresh = MinimumsAltitude.Value + 100f;
+                if (prevRadarAlt > thresh && currentAlt <= thresh)
+                {
+                    PlaySound("100Above");
+                    hundredAboveCalloutPlayed = true;
+                }
+                else if (currentAlt > thresh + 200) hundredAboveCalloutPlayed = false;
             }
 
             CheckAltThreshold(2500, currentAlt, Callout2500, Callout2500Style.Value);
@@ -263,9 +449,24 @@ namespace AirDataAnnouncer
             CheckAltThreshold(30, currentAlt, Callout30);
             CheckAltThreshold(20, currentAlt, Callout20);
             CheckAltThreshold(10, currentAlt, Callout10);
-            // 0 removed
 
             prevRadarAlt = currentAlt;
+        }
+
+        private float GetThrottle()
+        {
+            try
+            {
+                if (throttleField == null)
+                {
+                    // Prefer "throttle" field based on user token
+                    throttleField = CurrentAircraft.GetType().GetField("throttle", BindingFlags.Public | BindingFlags.Instance)
+                                 ?? CurrentAircraft.GetType().GetField("inputThrottle", BindingFlags.Public | BindingFlags.Instance);
+                }
+                if (throttleField != null) return (float)throttleField.GetValue(CurrentAircraft);
+            }
+            catch { }
+            return 1.0f;
         }
 
         private bool IsImperial()
@@ -275,30 +476,21 @@ namespace AirDataAnnouncer
                 InitializeReflection();
                 reflectionInitialized = true;
             }
-
-            // If we failed to find the setting, assume Metric (false)
             if (unitSystemMember == null) return false;
 
             try
             {
                 object val = null;
-                if (unitSystemMember is PropertyInfo p)
-                    val = p.GetValue(playerSettingsInstance, null);
-                else if (unitSystemMember is FieldInfo f)
-                    val = f.GetValue(playerSettingsInstance);
+                if (unitSystemMember is PropertyInfo p) val = p.GetValue(playerSettingsInstance, null);
+                else if (unitSystemMember is FieldInfo f) val = f.GetValue(playerSettingsInstance);
 
-                // Check for "Imperial" (case-insensitive) or value 1
                 if (val != null)
                 {
                     string s = val.ToString();
                     return s.Equals("Imperial", System.StringComparison.OrdinalIgnoreCase) || s == "1";
                 }
             }
-            catch
-            {
-                // Silently fail to default
-            }
-
+            catch { }
             return false;
         }
 
@@ -306,15 +498,10 @@ namespace AirDataAnnouncer
         {
             try
             {
-                // 1. Find PlayerSettings type
                 Type psType = AccessTools.TypeByName("PlayerSettings");
                 if (psType == null) return;
 
-                // 2. Look for the UnitSystem member (field or property)
-                // We check for lowercase 'unitSystem' first (common convention), then PascalCase 'UnitSystem'
-                // We ensure the return type is an Enum to avoid picking up the nested Type definition itself
                 var members = psType.GetMembers(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
-
                 foreach (var m in members)
                 {
                     if (m.Name.Equals("unitSystem", System.StringComparison.OrdinalIgnoreCase) ||
@@ -325,7 +512,6 @@ namespace AirDataAnnouncer
                     }
                 }
 
-                // 3. If the member is instance-based, we need the Singleton instance (usually 'Instance')
                 bool isStatic = false;
                 if (unitSystemMember is PropertyInfo prop) isStatic = prop.GetGetMethod(true).IsStatic;
                 else if (unitSystemMember is FieldInfo field) isStatic = field.IsStatic;
@@ -333,16 +519,10 @@ namespace AirDataAnnouncer
                 if (unitSystemMember != null && !isStatic)
                 {
                     var instProp = AccessTools.Property(psType, "Instance") ?? AccessTools.Property(psType, "instance");
-                    if (instProp != null)
-                    {
-                        playerSettingsInstance = instProp.GetValue(null, null);
-                    }
+                    if (instProp != null) playerSettingsInstance = instProp.GetValue(null, null);
                 }
             }
-            catch (System.Exception ex)
-            {
-                Logger.LogError($"Failed to initialize reflection for Unit Settings: {ex.Message}");
-            }
+            catch (System.Exception ex) { Logger.LogError($"Reflection Init Failed: {ex.Message}"); }
         }
 
         private void ProcessMach()
@@ -352,8 +532,7 @@ namespace AirDataAnnouncer
 
             if (SubsonicCallouts.Value)
             {
-                if (prevMach >= 1.0f && currentMach < 1.0f)
-                    PlaySound("subsonic");
+                if (prevMach >= 1.0f && currentMach < 1.0f) PlaySound("subsonic");
             }
 
             if (Mathf.Floor(currentMach) > Mathf.Floor(prevMach))
@@ -364,7 +543,6 @@ namespace AirDataAnnouncer
                     PlaySound($"Mach {machNumber}");
                 }
             }
-
             prevMach = currentMach;
         }
 
@@ -375,87 +553,52 @@ namespace AirDataAnnouncer
             if (prevRadarAlt > threshold && current <= threshold)
             {
                 string clipName = threshold.ToString();
-
-                if (threshold == 2500 && style == AltCalloutStyle.British)
-                {
-                    clipName = "2500_UK";
-                }
-
-                PlaySound(clipName);
-            }
-        }
-
-        public void PlaySound(string clipName)
-        {
-            if (DebugMode.Value)
-            {
-                debugMessage = $"GPWS: {clipName.ToUpper()}";
-                debugMessageTimer = 2.0f;
-            }
-
-            EnsureAudioSourceExists();
-
-            if (clipCache.TryGetValue(clipName, out AudioClip clip))
-            {
-                if (clip != null)
-                {
-                    audioSource.PlayOneShot(clip, MasterVolume.Value);
-                }
-                else
-                {
-                    Logger.LogWarning($"Sound '{clipName}' key exists but clip is null.");
-                }
-            }
-            else
-            {
-                if (DebugMode.Value)
-                {
-                    Logger.LogWarning($"Sound '{clipName}' not found in cache.");
-                    debugMessage += " (MISSING)";
-                }
+                if (threshold == 2500 && style == AltCalloutStyle.British) clipName = "2500_UK";
+                PlaySound(clipName, true); // Mark as altitude for skipping logic
             }
         }
 
         // --- Setup & Loading ---
 
-        private IEnumerator LoadSoundPack()
+        private IEnumerator LoadAllSounds()
         {
             soundsLoaded = false;
             clipCache.Clear();
 
-            string packName = SoundPack.Value;
+            string defaultPackName = SoundPack.Value;
             string basePath = Path.Combine(Paths.PluginPath, "AirDataAnnouncer", "Soundpacks");
-            string path = Path.Combine(basePath, packName);
 
-            if (!Directory.Exists(path))
-            {
-                Logger.LogError($"Soundpack not found at: {path}");
-                if (Directory.Exists(basePath))
-                {
-                    var dirs = Directory.GetDirectories(basePath).Select(Path.GetFileName);
-                    Logger.LogInfo($"Available packs: {string.Join(", ", dirs)}");
-                }
-                yield break;
-            }
+            if (LogToFile.Value) Logger.LogInfo($"Loading sounds. Master Pack: {defaultPackName}");
 
-            Logger.LogInfo($"Loading sounds from: {path}");
-
-            // "0" removed from list
-            var filesToLoad = new List<string> {
-                "10", "20", "30", "40", "50", "75", "100", "200", "300", "400", "500", "1000", "2500", "2500_UK", "subsonic",
-                "Gear Down", "Gear Up", "Gear Down and Locked", "Gear Up and Locked", "contact"
+            var keys = new List<string> {
+                "10", "20", "30", "40", "50", "75", "100", "200", "300", "400", "500", "1000", "2500", "2500_UK",
+                "subsonic", "Gear Down", "Gear Up", "Gear Down and Locked", "Gear Up and Locked", "contact",
+                "Retard", "Minimum", "100Above", "Cleared To Land"
             };
 
-            for (int i = 1; i <= 10; i++) filesToLoad.Add($"Mach {i}");
+            for (int i = 1; i <= 10; i++) keys.Add($"Mach {i}");
 
-            foreach (var filename in filesToLoad)
+            foreach (var key in keys)
             {
-                string filePath = Path.Combine(path, filename + ".wav");
+                string packToUse = defaultPackName;
+                if (PackOverrides.ContainsKey(key))
+                {
+                    string overrideVal = PackOverrides[key].Value;
+                    if (!string.IsNullOrEmpty(overrideVal) && overrideVal != "Default")
+                    {
+                        packToUse = overrideVal;
+                    }
+                }
+
+                string packPath = Path.Combine(basePath, packToUse);
+                string filename = key;
+
+                string filePath = Path.Combine(packPath, filename + ".wav");
                 AudioType type = AudioType.WAV;
 
                 if (!File.Exists(filePath))
                 {
-                    filePath = Path.Combine(path, filename + ".ogg");
+                    filePath = Path.Combine(packPath, filename + ".ogg");
                     type = AudioType.OGGVORBIS;
                 }
 
@@ -464,49 +607,34 @@ namespace AirDataAnnouncer
                     using (UnityWebRequest uwr = UnityWebRequestMultimedia.GetAudioClip("file://" + filePath, type))
                     {
                         yield return uwr.SendWebRequest();
-
                         if (uwr.result == UnityWebRequest.Result.Success)
                         {
                             var clip = DownloadHandlerAudioClip.GetContent(uwr);
                             if (clip != null)
                             {
                                 clip.name = filename;
-                                clipCache[filename] = clip;
+                                clipCache[key] = clip;
                             }
                         }
                     }
                 }
-                else
-                {
-                    if (DebugMode.Value && filename != "2500_UK") Logger.LogWarning($"File missing: {filename}");
-                }
             }
 
             soundsLoaded = true;
-            Logger.LogInfo($"Loaded {clipCache.Count} sounds successfully.");
+            if (LogToFile.Value) Logger.LogInfo($"Loaded {clipCache.Count} sounds.");
         }
 
         private void SetupConfig()
         {
-            // 1. General
-            DebugMode = Config.Bind(SectionGeneral, "Debug Mode", false, "Show visual text on screen when sounds play");
-            MasterVolume = Config.Bind(SectionGeneral, "Master Volume", 1.0f, new ConfigDescription("Volume of callouts", new AcceptableValueRange<float>(0f, 1f)));
+            DebugMode = Config.Bind(SectionGeneral, "Debug Mode", false, "Show visual text on screen");
+            LogToFile = Config.Bind(SectionGeneral, "Log To File", false, "Enable logging to the BepInEx console/file"); // New Config
+            MasterVolume = Config.Bind(SectionGeneral, "Master Volume", 1.0f, new ConfigDescription("Volume", new AcceptableValueRange<float>(0f, 1f)));
 
-            var soundPackPath = Path.Combine(Paths.PluginPath, "AirDataAnnouncer", "Soundpacks");
-            var soundPacks = Directory.Exists(soundPackPath)
-                ? Directory.GetDirectories(soundPackPath).Select(Path.GetFileName).ToArray()
-                : new[] { "Altea" };
+            SoundPack = Config.Bind(SectionGeneral, "Master Sound Pack", availablePacks.FirstOrDefault() ?? "Altea",
+                new ConfigDescription("Global sound pack", new AcceptableValueList<string>(availablePacks)));
 
-            SoundPack = Config.Bind(SectionGeneral, "Sound Pack", soundPacks.FirstOrDefault() ?? "Altea",
-                new ConfigDescription("Select sound pack", new AcceptableValueList<string>(soundPacks)));
+            SoundPack.SettingChanged += (s, a) => { if (this) StartCoroutine(LoadAllSounds()); };
 
-            SoundPack.SettingChanged += (sender, args) =>
-            {
-                if (this != null) StartCoroutine(LoadSoundPack());
-            };
-
-            // 2. Altitude Callouts
-            // 0 removed
             BindCallout(SectionAlt, "10 ft Callout", "10", ref Callout10);
             BindCallout(SectionAlt, "20 ft Callout", "20", ref Callout20);
             BindCallout(SectionAlt, "30 ft Callout", "30", ref Callout30);
@@ -521,26 +649,39 @@ namespace AirDataAnnouncer
             BindCallout(SectionAlt, "1000 ft Callout", "1000", ref Callout1000);
             BindCallout2500(SectionAlt, "2500 ft Callout", ref Callout2500);
 
-            // 3. Mach Callouts
-            BindCallout(SectionMach, "Subsonic Callouts", "subsonic", ref SubsonicCallouts);
+            BindCallout(SectionMach, "Subsonic", "subsonic", ref SubsonicCallouts);
             MachCallouts.Clear();
             for (int i = 1; i <= 10; i++)
             {
                 ConfigEntry<bool> entry = null;
-                BindCallout(SectionMach, $"Mach {i} Callout", $"Mach {i}", ref entry);
+                BindCallout(SectionMach, $"Mach {i}", $"Mach {i}", ref entry);
                 MachCallouts.Add(i, entry);
             }
 
-            // 4. Gear Callouts
-            BindCallout(SectionGear, "Gear Down (Action)", "Gear Down", ref GearDownCallout);
-            BindCallout(SectionGear, "Gear Up (Action)", "Gear Up", ref GearUpCallout);
+            BindCallout(SectionGear, "Gear Down", "Gear Down", ref GearDownCallout);
+            BindCallout(SectionGear, "Gear Up", "Gear Up", ref GearUpCallout);
             BindCallout(SectionGear, "Gear Down & Locked", "Gear Down and Locked", ref GearDownLockedCallout);
             BindCallout(SectionGear, "Gear Up & Locked", "Gear Up and Locked", ref GearUpLockedCallout);
-            BindCallout(SectionGear, "Contact (Weight On Wheels)", "contact", ref ContactCallout);
+            BindCallout(SectionGear, "Contact", "contact", ref ContactCallout);
+
+            BindCallout(SectionRunway, "Retard", "Retard", ref CalloutRetard, "Airbus");
+
+            MinimumsAltitude = Config.Bind(SectionRunway, "Minimums Altitude", 200, "Altitude for Minimums callout");
+            BindCallout(SectionRunway, "Minimums Callout", "Minimum", ref CalloutMinimums, "Airbus");
+            BindCallout(SectionRunway, "100 Above Callout", "100Above", ref Callout100Above, "Airbus");
+
+            BindCallout(SectionRunway, "Cleared To Land", "Cleared To Land", ref CalloutClearedToLand);
         }
 
-        private void BindCallout(string section, string key, string audioClipName, ref ConfigEntry<bool> entry)
+        private void BindCallout(string section, string key, string audioClipName, ref ConfigEntry<bool> entry, string defaultPack = "Default")
         {
+            var overrideEntry = Config.Bind(section, key + "_Pack", defaultPack,
+                new ConfigDescription("Override", new AcceptableValueList<string>(availablePacksWithDefault),
+                new ConfigurationManagerAttributes { Browsable = false }));
+
+            PackOverrides[audioClipName] = overrideEntry;
+            overrideEntry.SettingChanged += (s, a) => { if (this) StartCoroutine(LoadAllSounds()); };
+
             var description = new ConfigDescription(
                 $"Enable {key}",
                 null,
@@ -548,30 +689,46 @@ namespace AirDataAnnouncer
                 {
                     CustomDrawer = (ConfigEntryBase e) =>
                     {
-                        // Check if file exists in cache
+                        GUILayout.BeginHorizontal();
                         bool exists = Instance != null && Instance.clipCache.ContainsKey(audioClipName);
-
                         GUI.enabled = exists;
-                        if (GUILayout.Button("▶", GUILayout.Width(30))) Instance?.PlaySound(audioClipName);
+                        if (GUILayout.Button("▶", GUILayout.Width(25))) Instance?.PlaySound(audioClipName);
                         GUI.enabled = true;
+                        GUILayout.Space(5);
 
-                        GUILayout.Space(10);
                         bool value = (bool)e.BoxedValue;
-
-                        // Draw red text if missing
                         var originalColor = GUI.color;
                         if (!exists) GUI.color = Color.red;
-
-                        bool newValue = GUILayout.Toggle(value, new GUIContent(key, exists ? null : "Sound file missing"));
-
-                        if (!exists)
-                        {
-                            GUILayout.Label("(Missing)", GUILayout.ExpandWidth(false));
-                        }
-
+                        bool newValue = GUILayout.Toggle(value, new GUIContent(key, exists ? null : "Sound file missing in selected pack"));
+                        if (!exists) GUILayout.Label("(Missing)", GUILayout.ExpandWidth(false));
                         GUI.color = originalColor;
-
                         if (newValue != value) e.BoxedValue = newValue;
+
+                        GUILayout.FlexibleSpace();
+                        GUILayout.Label("Pack:");
+                        string currentOverride = overrideEntry.Value;
+
+                        if (!Instance.dropdownStates.ContainsKey(key)) Instance.dropdownStates[key] = false;
+
+                        if (GUILayout.Button(currentOverride, GUILayout.Width(150)))
+                        {
+                            Instance.dropdownStates[key] = !Instance.dropdownStates[key];
+                        }
+                        GUILayout.EndHorizontal();
+
+                        if (Instance.dropdownStates[key])
+                        {
+                            GUILayout.BeginVertical(GUI.skin.box);
+                            foreach (var pack in Instance.availablePacksWithDefault)
+                            {
+                                if (GUILayout.Button(pack))
+                                {
+                                    overrideEntry.Value = pack;
+                                    Instance.dropdownStates[key] = false;
+                                }
+                            }
+                            GUILayout.EndVertical();
+                        }
                     }
                 }
             );
@@ -583,6 +740,14 @@ namespace AirDataAnnouncer
             Callout2500Style = Config.Bind(section, "2500 ft Style", AltCalloutStyle.American,
                 new ConfigDescription("Style", null, new ConfigurationManagerAttributes { Browsable = false }));
 
+            var overrideEntry = Config.Bind(section, key + "_Pack", "Default",
+                new ConfigDescription("Override", new AcceptableValueList<string>(availablePacksWithDefault),
+                new ConfigurationManagerAttributes { Browsable = false }));
+            PackOverrides["2500"] = overrideEntry;
+            PackOverrides["2500_UK"] = overrideEntry;
+
+            overrideEntry.SettingChanged += (s, a) => { if (this) StartCoroutine(LoadAllSounds()); };
+
             var description = new ConfigDescription(
                 $"Enable {key}",
                 null,
@@ -593,31 +758,50 @@ namespace AirDataAnnouncer
                         string clipToPlay = (Callout2500Style.Value == AltCalloutStyle.British) ? "2500_UK" : "2500";
                         bool exists = Instance != null && Instance.clipCache.ContainsKey(clipToPlay);
 
+                        GUILayout.BeginHorizontal();
                         GUI.enabled = exists;
-                        if (GUILayout.Button("▶", GUILayout.Width(30))) Instance?.PlaySound(clipToPlay);
+                        if (GUILayout.Button("▶", GUILayout.Width(25))) Instance?.PlaySound(clipToPlay);
                         GUI.enabled = true;
+                        GUILayout.Space(5);
 
-                        GUILayout.Space(10);
                         bool value = (bool)e.BoxedValue;
-
                         var originalColor = GUI.color;
                         if (!exists) GUI.color = Color.red;
-
                         bool newValue = GUILayout.Toggle(value, new GUIContent(key, exists ? null : "Sound file missing"));
-
                         if (!exists) GUILayout.Label("(Missing)", GUILayout.ExpandWidth(false));
-
                         GUI.color = originalColor;
-
                         if (newValue != value) e.BoxedValue = newValue;
 
-                        GUILayout.Space(15);
+                        GUILayout.FlexibleSpace();
                         GUILayout.Label("Style:");
+                        int selStyle = (int)Callout2500Style.Value;
+                        string[] styleOpts = { "US", "UK" };
+                        int newStyle = GUILayout.Toolbar(selStyle, styleOpts, GUILayout.Width(80));
+                        if (newStyle != selStyle) Callout2500Style.Value = (AltCalloutStyle)newStyle;
+
                         GUILayout.Space(5);
-                        int selected = (int)Callout2500Style.Value;
-                        string[] options = { "US (2500)", "UK (2500)" };
-                        int newSelected = GUILayout.Toolbar(selected, options, GUILayout.Width(150));
-                        if (newSelected != selected) Callout2500Style.Value = (AltCalloutStyle)newSelected;
+
+                        if (!Instance.dropdownStates.ContainsKey(key)) Instance.dropdownStates[key] = false;
+
+                        if (GUILayout.Button(overrideEntry.Value, GUILayout.Width(100)))
+                        {
+                            Instance.dropdownStates[key] = !Instance.dropdownStates[key];
+                        }
+                        GUILayout.EndHorizontal();
+
+                        if (Instance.dropdownStates[key])
+                        {
+                            GUILayout.BeginVertical(GUI.skin.box);
+                            foreach (var pack in Instance.availablePacksWithDefault)
+                            {
+                                if (GUILayout.Button(pack))
+                                {
+                                    overrideEntry.Value = pack;
+                                    Instance.dropdownStates[key] = false;
+                                }
+                            }
+                            GUILayout.EndVertical();
+                        }
                     }
                 }
             );
@@ -631,13 +815,16 @@ namespace AirDataAnnouncer
             CurrentAircraft = aircraft;
             if (Instance != null)
             {
-                // Cache landing gears for performance
                 Instance.CurrentLandingGears = aircraft.GetComponentsInChildren<LandingGear>();
                 Instance.prevGearDeployed = aircraft.gearDeployed;
                 Instance.prevGearState = aircraft.gearState;
                 Instance.prevRadarAlt = aircraft.radarAlt;
                 Instance.wasGrounded = true;
-                Instance.contactArmed = false; // Reset on new plane
+                Instance.contactArmed = false;
+
+                Instance.minimumsCalloutPlayed = false;
+                Instance.hundredAboveCalloutPlayed = false;
+                Instance.throttleField = null;
             }
         }
     }
