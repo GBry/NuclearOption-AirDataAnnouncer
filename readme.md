@@ -1,5 +1,7 @@
 # GPWS Altitude Callouts Mod
 
+Copy to its own folder in Bepinex/plugins. Make a new folder (AirDataAnnouncer or something)
+
 "Altea" soundpack is from the XR project (https://www.alteaaerospace.com/)
 
 Pretty straightforward.
