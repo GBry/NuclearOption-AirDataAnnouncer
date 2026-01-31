@@ -17,5 +17,6 @@ Available modes:
 - Gear up/down locked
 - Altitude callouts
 - 100 Above
+- Pull Up
 - Minimum
 - Retard
