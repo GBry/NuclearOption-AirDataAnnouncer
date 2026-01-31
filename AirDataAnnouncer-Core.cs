@@ -12,7 +12,7 @@ using UnityEngine.Networking;
 
 namespace AirDataAnnouncer
 {
-    [BepInPlugin("com.yourname.airdataannouncer", "AirDataAnnouncer", "1.3.7")]
+    [BepInPlugin("com.yourname.airdataannouncer", "AirDataAnnouncer", "1.4.5")]
     public class AirDataAnnouncer : BaseUnityPlugin
     {
         public static AirDataAnnouncer Instance { get; private set; }
@@ -72,6 +72,8 @@ namespace AirDataAnnouncer
         internal static ConfigEntry<int> MinimumsAltitude;
         internal static ConfigEntry<bool> Callout100Above;
         internal static ConfigEntry<bool> CalloutClearedToLand;
+        internal static ConfigEntry<bool> CalloutPullUp;
+        internal static ConfigEntry<float> PullUpSensitivity; // New Config
 
         // --- State ---
         public static Aircraft CurrentAircraft;
@@ -86,7 +88,7 @@ namespace AirDataAnnouncer
         {
             public string Name;
             public AudioClip Clip;
-            public bool IsAltitude; // Added flag for skipping logic
+            public bool IsAltitude;
         }
         private Queue<QueuedClip> audioQueue = new Queue<QueuedClip>();
         private string currentPlayingClipName = "";
@@ -100,6 +102,9 @@ namespace AirDataAnnouncer
 
         // Tracking Variables
         private float prevRadarAlt;
+        private Vector3 prevPos; // Track 3D Position for manual velocity
+        private Vector3 currentVelocity; // Calculated manually
+        private float smoothedVerticalSpeed; // For smoothing
         private float prevMach;
 
         // Gear Tracking
@@ -114,7 +119,8 @@ namespace AirDataAnnouncer
         private bool minimumsCalloutPlayed = false;
         private bool hundredAboveCalloutPlayed = false;
         private float lastClearedToLandTime = -999f;
-        private float lastRetardTime = -999f; // Debounce for Retard
+        private float lastRetardTime = -999f;
+        private float lastPullUpTime = -999f;
 
         private bool soundsLoaded = false;
         private string debugMessage = "";
@@ -134,10 +140,8 @@ namespace AirDataAnnouncer
             SetupConfig();
             EnsureAudioSourceExists();
 
-            // Standard patches
             var harmony = Harmony.CreateAndPatchAll(typeof(AirDataAnnouncer));
 
-            // Manual Dynamic Patch for AircraftActionsReport (Text Detection)
             try
             {
                 var reportType = AccessTools.TypeByName("AircraftActionsReport");
@@ -163,19 +167,16 @@ namespace AirDataAnnouncer
             Logger.LogInfo("AirDataAnnouncer initialized.");
         }
 
-        // --- Hook for Cleared to Land ---
         public static void ReportTextHook(string report)
         {
             if (Instance == null || string.IsNullOrEmpty(report)) return;
 
-            // Check LogToFile config
             if (LogToFile.Value) Instance.Logger.LogInfo($"[ReportText]: {report}");
 
             if (!CalloutClearedToLand.Value) return;
 
             if (Time.time - Instance.lastClearedToLandTime < 5f) return;
 
-            // Updated text detection string
             if (report.IndexOf("Cleared for landing", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 Instance.PlaySound("Cleared To Land");
@@ -208,10 +209,33 @@ namespace AirDataAnnouncer
                 if (debugMessageTimer <= 0) debugMessage = "";
             }
 
-            if (CurrentAircraft == null || !soundsLoaded) return;
-
+            // Allow audio processing in main menu (previews)
+            if (!soundsLoaded) return;
             ProcessAudioQueue();
+
+            // Stop here if no aircraft (Main Menu)
+            if (CurrentAircraft == null) return;
+
+            // Calculate 3D Velocity & Vertical Speed manually
+            // This bypasses the need for Rigidbody or Physics assemblies
+            Vector3 currentPos = CurrentAircraft.transform.position;
+            if (Time.deltaTime > 0)
+            {
+                Vector3 delta = currentPos - prevPos;
+                // Floating Origin Check: If we moved impossibly fast (> 2000m/s in one frame), 
+                // it's likely an origin shift. Skip velocity update.
+                if (delta.sqrMagnitude < 4000000f)
+                {
+                    currentVelocity = delta / Time.deltaTime;
+                }
+            }
+            prevPos = currentPos;
+
+            // Smooth Vertical Speed (Simple Low Pass Filter)
+            smoothedVerticalSpeed = Mathf.Lerp(smoothedVerticalSpeed, currentVelocity.y, Time.deltaTime * 5f);
+
             ProcessAltitude();
+            ProcessGPWS(smoothedVerticalSpeed); // Pass Smoothed Vertical Speed
             ProcessMach();
             ProcessGear();
             ProcessContact();
@@ -256,17 +280,15 @@ namespace AirDataAnnouncer
 
             if (audioSource.isPlaying)
             {
-                // Special Exception: If "Retard" is playing and throttle is cut, stop immediately
-                // to allow next queued sound (if any) or silence.
-                if (currentPlayingClipName == "Retard")
+                if (currentPlayingClipName == "Retard" && CurrentAircraft != null)
                 {
                     if (GetThrottle() <= 0.05f)
                     {
                         audioSource.Stop();
-                        if (DebugMode.Value) debugMessage = ""; // Clear text if stopped
+                        if (DebugMode.Value) debugMessage = "";
                     }
                 }
-                return; // Wait for current sound to finish
+                return;
             }
 
             if (audioQueue.Count > 0)
@@ -283,7 +305,6 @@ namespace AirDataAnnouncer
             }
         }
 
-        // Updated PlaySound with skipping logic for altitudes
         public void PlaySound(string clipName, bool isAltitude = false)
         {
             if (DebugMode.Value)
@@ -300,23 +321,14 @@ namespace AirDataAnnouncer
                 {
                     if (isAltitude)
                     {
-                        // Optimization: If the new sound is an altitude callout,
-                        // remove any PENDING altitude callouts from the queue.
-                        // This prevents "200, 100, 50" stack up during fast descent.
-                        // We filter out any QueuedClip where IsAltitude is true.
                         var filteredList = audioQueue.Where(x => !x.IsAltitude).ToList();
-
-                        // If we removed items and debug is on, log it
                         if (LogToFile.Value && filteredList.Count < audioQueue.Count)
                         {
                             Logger.LogInfo($"Skipping {audioQueue.Count - filteredList.Count} stale altitude callouts for {clipName}");
                         }
-
-                        // Rebuild queue
                         audioQueue = new Queue<QueuedClip>(filteredList);
                     }
 
-                    // Enqueue new clip
                     audioQueue.Enqueue(new QueuedClip { Name = clipName, Clip = clip, IsAltitude = isAltitude });
                 }
                 else if (LogToFile.Value)
@@ -331,6 +343,61 @@ namespace AirDataAnnouncer
                     Logger.LogWarning($"Sound '{clipName}' not found in cache.");
                     debugMessage += " (MISSING)";
                 }
+            }
+        }
+
+        private void ProcessGPWS(float verticalSpeed)
+        {
+            if (!CalloutPullUp.Value) return;
+            if (Time.time - lastPullUpTime < 1.5f) return;
+
+            // Inhibit if nose is up (> 20 degrees, approx 0.34 in forward.y)
+            float forwardY = CurrentAircraft.transform.forward.y;
+            if (forwardY > 0.34f) return;
+
+            bool trigger = false;
+            float radarAlt = CurrentAircraft.radarAlt;
+
+            // Mode 1: Excessive Sink Rate (Basic) - Predicts impact if vertical speed is maintained
+            float sinkRate = -verticalSpeed;
+            float warningTimeBase = 3.0f * PullUpSensitivity.Value;
+
+            if (sinkRate > 1.0f)
+            {
+                float tti = radarAlt / sinkRate;
+                if (tti < warningTimeBase) trigger = true;
+            }
+
+            // Mode 2: Forward Look (EGPWS) - Raycast
+            // Predicts impact along current trajectory (velocity vector)
+            if (!trigger)
+            {
+                float speed = currentVelocity.magnitude;
+                if (speed > 30f) // Only active above ~60kts
+                {
+                    // Calculate look ahead distance based on speed and time threshold
+                    float lookAheadDist = speed * warningTimeBase;
+                    Vector3 direction = currentVelocity.normalized;
+
+                    // FIX: Start ray 20m ahead to avoid hitting own aircraft collider
+                    Vector3 startPos = CurrentAircraft.transform.position + (direction * 20f);
+
+                    // Cast ray along velocity vector
+                    if (Physics.Raycast(startPos, direction, out RaycastHit hit, lookAheadDist))
+                    {
+                        // We hit something within our impact time window
+                        trigger = true;
+
+                        if (DebugMode.Value && LogToFile.Value)
+                            Logger.LogInfo($"EGPWS Raycast Hit: {hit.collider.name} at {hit.distance:F1}m");
+                    }
+                }
+            }
+
+            if (trigger)
+            {
+                PlaySound("Pull Up");
+                lastPullUpTime = Time.time;
             }
         }
 
@@ -402,7 +469,6 @@ namespace AirDataAnnouncer
             {
                 bool shouldRetard = (prevRadarAlt > 20 && currentAlt <= 20) || (prevRadarAlt > 10 && currentAlt <= 10);
 
-                // Check debounce (1 second)
                 if (shouldRetard && (Time.time - lastRetardTime > 1.0f))
                 {
                     float throttle = GetThrottle();
@@ -527,7 +593,7 @@ namespace AirDataAnnouncer
 
         private void ProcessMach()
         {
-            float speedOfSound = LevelInfo.GetSpeedofSound(CurrentAircraft.transform.position.GlobalY());
+            float speedOfSound = 343f; // Fixed constant to avoid LevelInfo missing member error
             float currentMach = CurrentAircraft.speed / speedOfSound;
 
             if (SubsonicCallouts.Value)
@@ -554,11 +620,9 @@ namespace AirDataAnnouncer
             {
                 string clipName = threshold.ToString();
                 if (threshold == 2500 && style == AltCalloutStyle.British) clipName = "2500_UK";
-                PlaySound(clipName, true); // Mark as altitude for skipping logic
+                PlaySound(clipName, true);
             }
         }
-
-        // --- Setup & Loading ---
 
         private IEnumerator LoadAllSounds()
         {
@@ -573,7 +637,7 @@ namespace AirDataAnnouncer
             var keys = new List<string> {
                 "10", "20", "30", "40", "50", "75", "100", "200", "300", "400", "500", "1000", "2500", "2500_UK",
                 "subsonic", "Gear Down", "Gear Up", "Gear Down and Locked", "Gear Up and Locked", "contact",
-                "Retard", "Minimum", "100Above", "Cleared To Land"
+                "Retard", "Minimum", "100Above", "Cleared To Land", "Pull Up"
             };
 
             for (int i = 1; i <= 10; i++) keys.Add($"Mach {i}");
@@ -627,7 +691,7 @@ namespace AirDataAnnouncer
         private void SetupConfig()
         {
             DebugMode = Config.Bind(SectionGeneral, "Debug Mode", false, "Show visual text on screen");
-            LogToFile = Config.Bind(SectionGeneral, "Log To File", false, "Enable logging to the BepInEx console/file"); // New Config
+            LogToFile = Config.Bind(SectionGeneral, "Log To File", false, "Enable logging to the BepInEx console/file");
             MasterVolume = Config.Bind(SectionGeneral, "Master Volume", 1.0f, new ConfigDescription("Volume", new AcceptableValueRange<float>(0f, 1f)));
 
             SoundPack = Config.Bind(SectionGeneral, "Master Sound Pack", availablePacks.FirstOrDefault() ?? "Altea",
@@ -671,6 +735,10 @@ namespace AirDataAnnouncer
             BindCallout(SectionRunway, "100 Above Callout", "100Above", ref Callout100Above, "Airbus");
 
             BindCallout(SectionRunway, "Cleared To Land", "Cleared To Land", ref CalloutClearedToLand);
+
+            // New Config for Pull Up
+            BindCallout(SectionRunway, "Pull Up Warning", "Pull Up", ref CalloutPullUp, "Betty");
+            PullUpSensitivity = Config.Bind(SectionRunway, "Pull Up Sensitivity", 0.486f, new ConfigDescription("Adjust sensitivity of GPWS Pull Up warning (Higher = More Sensitive)", new AcceptableValueRange<float>(0.1f, 2.0f)));
         }
 
         private void BindCallout(string section, string key, string audioClipName, ref ConfigEntry<bool> entry, string defaultPack = "Default")
@@ -819,6 +887,7 @@ namespace AirDataAnnouncer
                 Instance.prevGearDeployed = aircraft.gearDeployed;
                 Instance.prevGearState = aircraft.gearState;
                 Instance.prevRadarAlt = aircraft.radarAlt;
+                Instance.prevPos = aircraft.transform.position; // Init position
                 Instance.wasGrounded = true;
                 Instance.contactArmed = false;
 
